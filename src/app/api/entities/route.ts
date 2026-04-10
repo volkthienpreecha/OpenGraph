@@ -1,7 +1,7 @@
 import { NextRequest, NextResponse } from 'next/server'
 import { getDb } from '@/lib/db'
 import { entities, documentEntities } from '@/lib/db/schema'
-import { eq, isNull, desc, sql } from 'drizzle-orm'
+import { eq, isNull, desc, sql, inArray } from 'drizzle-orm'
 
 export async function GET(request: NextRequest) {
   const { searchParams } = new URL(request.url)
@@ -23,18 +23,27 @@ export async function GET(request: NextRequest) {
 
   const filtered = type ? rows.filter(e => e.type === type) : rows
 
-  // Add mention counts
-  const withCounts = await Promise.all(filtered.map(async (e) => {
-    const mentions = await db
-      .select({ total: sql<number>`sum(${documentEntities.mentions})` })
-      .from(documentEntities)
-      .where(eq(documentEntities.entityId, e.id))
+  if (filtered.length === 0) {
+    return NextResponse.json([])
+  }
 
-    return {
-      ...e,
-      metadata: JSON.parse(e.metadata),
-      mentionCount: mentions[0]?.total || 0,
-    }
+  // Single aggregated query instead of one query per entity (fixes N+1).
+  const filteredIds = filtered.map(e => e.id)
+  const mentionTotals = await db
+    .select({
+      entityId: documentEntities.entityId,
+      total: sql<number>`sum(${documentEntities.mentions})`,
+    })
+    .from(documentEntities)
+    .where(inArray(documentEntities.entityId, filteredIds))
+    .groupBy(documentEntities.entityId)
+
+  const countMap = new Map(mentionTotals.map(m => [m.entityId, m.total]))
+
+  const withCounts = filtered.map(e => ({
+    ...e,
+    metadata: JSON.parse(e.metadata),
+    mentionCount: countMap.get(e.id) || 0,
   }))
 
   return NextResponse.json(withCounts)

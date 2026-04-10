@@ -1,6 +1,6 @@
 import { getDb } from '@/lib/db'
 import { entities, relationships, documentEntities } from '@/lib/db/schema'
-import { eq, or, inArray, and, isNull, ne } from 'drizzle-orm'
+import { eq, or, inArray, and, isNull } from 'drizzle-orm'
 import type { GraphData, GraphNode, GraphLink, EntityType } from '@/types'
 
 const NODE_COLORS: Record<string, string> = {
@@ -69,40 +69,76 @@ export async function getFullGraph(filter?: { type?: EntityType }): Promise<Grap
   return { nodes, links }
 }
 
+/**
+ * BFS path search with lazy, level-by-level adjacency loading.
+ *
+ * Previously this loaded every row in the relationships table upfront
+ * (SELECT * FROM relationships with no WHERE clause), which OOMs on large
+ * graphs. Now we load only the neighbor lists for nodes we actually visit,
+ * one batch per BFS level — at most `maxHops` database round-trips total.
+ */
 export async function findPaths(fromEntityId: number, toEntityId: number, maxHops = 4): Promise<GraphData> {
   const db = getDb()
 
-  // BFS over the graph
+  // adj[id] = list of neighbor ids. A key present in the map means the
+  // node's edges have already been fetched from the DB.
   const adj = new Map<number, number[]>()
-  const allRels = await db.select().from(relationships)
 
-  for (const rel of allRels) {
-    if (!adj.has(rel.sourceId)) adj.set(rel.sourceId, [])
-    if (!adj.has(rel.targetId)) adj.set(rel.targetId, [])
-    adj.get(rel.sourceId)!.push(rel.targetId)
-    adj.get(rel.targetId)!.push(rel.sourceId)
+  async function ensureLoaded(ids: number[]) {
+    const fresh = ids.filter(id => !adj.has(id))
+    if (!fresh.length) return
+    // Pre-mark so parallel calls don't double-fetch
+    for (const id of fresh) adj.set(id, [])
+    const rels = await db
+      .select()
+      .from(relationships)
+      .where(
+        or(
+          inArray(relationships.sourceId, fresh),
+          inArray(relationships.targetId, fresh)
+        )
+      )
+    for (const rel of rels) {
+      adj.get(rel.sourceId)?.push(rel.targetId)
+      adj.get(rel.targetId)?.push(rel.sourceId)
+    }
   }
 
-  // BFS
-  const visited = new Set<number>()
-  const queue: { node: number; path: number[] }[] = [{ node: fromEntityId, path: [fromEntityId] }]
-  visited.add(fromEntityId)
+  // Load the start node's neighbors before BFS begins
+  await ensureLoaded([fromEntityId])
+
+  type QItem = { node: number; path: number[] }
+  const visited = new Set<number>([fromEntityId])
+  let currentLevel: QItem[] = [{ node: fromEntityId, path: [fromEntityId] }]
   const foundPaths: number[][] = []
 
-  while (queue.length > 0) {
-    const { node, path } = queue.shift()!
-    if (path.length > maxHops + 1) continue
-    if (node === toEntityId) {
-      foundPaths.push(path)
-      if (foundPaths.length >= 3) break
-      continue
-    }
-    for (const neighbor of adj.get(node) || []) {
-      if (!visited.has(neighbor)) {
-        visited.add(neighbor)
-        queue.push({ node: neighbor, path: [...path, neighbor] })
+  for (let hop = 0; hop < maxHops && currentLevel.length > 0 && foundPaths.length < 3; hop++) {
+    const nextLevel: QItem[] = []
+    const nextNodes = new Set<number>()
+
+    for (const { node, path } of currentLevel) {
+      if (node === toEntityId) {
+        foundPaths.push(path)
+        if (foundPaths.length >= 3) break
+        continue
+      }
+      for (const neighbor of adj.get(node) || []) {
+        if (!visited.has(neighbor)) {
+          visited.add(neighbor)
+          nextNodes.add(neighbor)
+          nextLevel.push({ node: neighbor, path: [...path, neighbor] })
+        }
       }
     }
+
+    if (foundPaths.length >= 3) break
+    if (nextNodes.size > 0) await ensureLoaded([...nextNodes])
+    currentLevel = nextLevel
+  }
+
+  // Check if destination is in the final level
+  for (const { node, path } of currentLevel) {
+    if (node === toEntityId && foundPaths.length < 3) foundPaths.push(path)
   }
 
   if (foundPaths.length === 0) return { nodes: [], links: [] }

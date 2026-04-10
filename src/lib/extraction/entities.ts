@@ -10,12 +10,21 @@ export interface ExtractedEntity {
 const EMAIL_RE = /[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}/g
 const URL_RE = /https?:\/\/[^\s<>"{}|\\^`[\]]+/g
 
-function getContext(text: string, match: string, windowSize = 120): string {
-  const idx = text.indexOf(match)
-  if (idx === -1) return ''
-  const start = Math.max(0, idx - windowSize / 2)
-  const end = Math.min(text.length, idx + match.length + windowSize / 2)
-  return '…' + text.slice(start, end).replace(/\n+/g, ' ').trim() + '…'
+/**
+ * Collect up to `maxContexts` surrounding snippets for every occurrence of
+ * `match` in `text`. Previously only the first occurrence was captured.
+ */
+function getAllContexts(text: string, match: string, windowSize = 120, maxContexts = 5): string[] {
+  const contexts: string[] = []
+  const escaped = match.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+  const re = new RegExp(escaped, 'gi')
+  let m: RegExpExecArray | null
+  while ((m = re.exec(text)) !== null && contexts.length < maxContexts) {
+    const start = Math.max(0, m.index - windowSize / 2)
+    const end = Math.min(text.length, m.index + match.length + windowSize / 2)
+    contexts.push('…' + text.slice(start, end).replace(/\n+/g, ' ').trim() + '…')
+  }
+  return contexts.length > 0 ? contexts : ['']
 }
 
 function countOccurrences(text: string, term: string): number {
@@ -26,58 +35,57 @@ function countOccurrences(text: string, term: string): number {
 export function extractEntities(text: string): ExtractedEntity[] {
   const results = new Map<string, ExtractedEntity>()
 
+  /**
+   * Insert an entity exactly once. Subsequent calls for the same key are
+   * ignored — `countOccurrences` already captures the correct total on the
+   * first call, so incrementing again on duplicates would inflate the count.
+   */
   function upsert(name: string, type: ExtractedEntity['type']) {
     const key = `${type}:${name.toLowerCase()}`
-    if (results.has(key)) {
-      const existing = results.get(key)!
-      existing.mentions++
-    } else {
+    if (!results.has(key)) {
       results.set(key, {
         name,
         type,
         mentions: countOccurrences(text, name),
-        contexts: [getContext(text, name)],
+        contexts: getAllContexts(text, name),
       })
     }
   }
 
-  // NLP: people + organizations
   const doc = nlp(text)
 
-  // People
-  const people = doc.people().out('array') as string[]
+  // Deduplicate NLP arrays before processing to prevent double-counting when
+  // compromise returns the same surface form more than once.
+  const people = [...new Set(doc.people().out('array') as string[])]
   for (const name of people) {
     const cleaned = name.trim()
-    if (cleaned.length > 1 && cleaned.length < 80) {
-      upsert(cleaned, 'person')
-    }
+    if (cleaned.length > 1 && cleaned.length < 80) upsert(cleaned, 'person')
   }
 
-  // Organizations
-  const orgs = doc.organizations().out('array') as string[]
+  const orgs = [...new Set(doc.organizations().out('array') as string[])]
   for (const org of orgs) {
     const cleaned = org.trim()
-    if (cleaned.length > 1 && cleaned.length < 100) {
-      upsert(cleaned, 'organization')
-    }
+    if (cleaned.length > 1 && cleaned.length < 100) upsert(cleaned, 'organization')
   }
 
-  // Emails via regex
-  const emails = text.match(EMAIL_RE) || []
+  // Deduplicate emails before upsert so `countOccurrences` isn't
+  // supplemented by extra `mentions++` calls for repeated addresses.
+  const emails = [...new Set((text.match(EMAIL_RE) || []).map(e => e.toLowerCase()))]
   for (const email of emails) {
-    upsert(email.toLowerCase(), 'email')
+    upsert(email, 'email')
   }
 
-  // URLs via regex
-  const urls = text.match(URL_RE) || []
-  for (const url of urls) {
-    // Deduplicate to domain level for display, keep full URL in metadata
+  // Deduplicate URLs at hostname level before upsert.
+  const hostnames = new Set<string>()
+  for (const url of text.match(URL_RE) || []) {
     try {
-      const parsed = new URL(url)
-      upsert(parsed.hostname, 'url')
+      hostnames.add(new URL(url).hostname)
     } catch {
-      upsert(url.slice(0, 100), 'url')
+      hostnames.add(url.slice(0, 100))
     }
+  }
+  for (const hostname of hostnames) {
+    upsert(hostname, 'url')
   }
 
   return Array.from(results.values()).filter(e => e.mentions > 0)

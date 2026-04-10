@@ -1,17 +1,24 @@
 import { NextRequest, NextResponse } from 'next/server'
-import { getDb } from '@/lib/db'
+import { getDb, withTransaction } from '@/lib/db'
 import { documents, entities, documentEntities, relationships } from '@/lib/db/schema'
 import { extractPdfText } from '@/lib/ingestion/pdf'
 import { extractTextContent } from '@/lib/ingestion/text'
 import { extractCsvText } from '@/lib/ingestion/csv'
 import { extractEntities } from '@/lib/extraction/entities'
-import { eq, and } from 'drizzle-orm'
+import { eq, and, inArray } from 'drizzle-orm'
+
+const MAX_FILE_SIZE = 50 * 1024 * 1024 // 50 MB
 
 export async function POST(request: NextRequest) {
   try {
     const formData = await request.formData()
     const file = formData.get('file') as File | null
     if (!file) return NextResponse.json({ error: 'No file provided' }, { status: 400 })
+
+    // Fix #7: reject oversized files before reading into memory
+    if (file.size > MAX_FILE_SIZE) {
+      return NextResponse.json({ error: 'File too large. Maximum 50 MB.' }, { status: 413 })
+    }
 
     const name = file.name
     const ext = name.split('.').pop()?.toLowerCase() as 'pdf' | 'txt' | 'md' | 'csv'
@@ -37,98 +44,134 @@ export async function POST(request: NextRequest) {
       text = result.text
     }
 
+    const extracted = extractEntities(text)
     const db = getDb()
 
-    // Insert document
-    const [doc] = await db.insert(documents).values({
-      name,
-      type: ext,
-      content: text.slice(0, 500_000), // cap at 500k chars
-      metadata: JSON.stringify(metadata),
-    }).returning()
+    // Fix #3 + #2: wrap everything in a transaction and batch all DB round-trips
+    const response = await withTransaction(async () => {
+      const [doc] = await db.insert(documents).values({
+        name,
+        type: ext,
+        content: text.slice(0, 500_000),
+        metadata: JSON.stringify(metadata),
+      }).returning()
 
-    // Extract entities
-    const extracted = extractEntities(text)
-    const entityIds: number[] = []
-
-    for (const e of extracted) {
-      // Check if entity already exists (case-insensitive)
-      const existing = await db
-        .select()
-        .from(entities)
-        .where(and(eq(entities.name, e.name), eq(entities.type, e.type)))
-        .limit(1)
-
-      let entityId: number
-      if (existing.length > 0) {
-        entityId = existing[0].id
-      } else {
-        const [newEntity] = await db.insert(entities).values({
-          name: e.name,
-          type: e.type,
-          metadata: JSON.stringify({ contexts: e.contexts }),
-        }).returning()
-        entityId = newEntity.id
-      }
-
-      // Link entity to document
-      const existingLink = await db
-        .select()
-        .from(documentEntities)
-        .where(and(
-          eq(documentEntities.documentId, doc.id),
-          eq(documentEntities.entityId, entityId)
-        ))
-        .limit(1)
-
-      if (existingLink.length === 0) {
-        await db.insert(documentEntities).values({
-          documentId: doc.id,
-          entityId,
-          mentions: e.mentions,
-          context: e.contexts[0] || '',
-        })
-      }
-
-      entityIds.push(entityId)
-    }
-
-    // Build co-occurrence relationships between entities in this document
-    for (let i = 0; i < entityIds.length; i++) {
-      for (let j = i + 1; j < entityIds.length; j++) {
-        const src = entityIds[i], tgt = entityIds[j]
-        const existing = await db
-          .select()
-          .from(relationships)
-          .where(and(
-            eq(relationships.sourceId, src),
-            eq(relationships.targetId, tgt),
-          ))
-          .limit(1)
-
-        if (existing.length === 0) {
-          await db.insert(relationships).values({
-            sourceId: src,
-            targetId: tgt,
-            type: 'CO_OCCURS',
-            weight: 1,
-            documentId: doc.id,
-          })
-        } else {
-          // Strengthen existing edge
-          await db
-            .update(relationships)
-            .set({ weight: existing[0].weight + 0.5 })
-            .where(eq(relationships.id, existing[0].id))
+      if (extracted.length === 0) {
+        return {
+          document: { id: doc.id, name: doc.name, type: doc.type },
+          entitiesExtracted: 0,
+          relationships: 0,
         }
       }
-    }
 
-    return NextResponse.json({
-      document: { id: doc.id, name: doc.name, type: doc.type },
-      entitiesExtracted: extracted.length,
-      relationships: (entityIds.length * (entityIds.length - 1)) / 2,
+      // --- Batch entity resolution (was one SELECT per entity) ---
+      const nameList = [...new Set(extracted.map(e => e.name))]
+      const existingEntities = await db
+        .select()
+        .from(entities)
+        .where(inArray(entities.name, nameList))
+
+      const entityMap = new Map<string, number>()
+      for (const e of existingEntities) {
+        entityMap.set(`${e.type}:${e.name}`, e.id)
+      }
+
+      const toInsertEntities = extracted.filter(
+        e => !entityMap.has(`${e.type}:${e.name}`)
+      )
+      if (toInsertEntities.length > 0) {
+        const inserted = await db.insert(entities).values(
+          toInsertEntities.map(e => ({
+            name: e.name,
+            type: e.type,
+            metadata: JSON.stringify({ contexts: e.contexts }),
+          }))
+        ).returning()
+        for (const row of inserted) {
+          entityMap.set(`${row.type}:${row.name}`, row.id)
+        }
+      }
+
+      const entityIds = extracted.map(e => entityMap.get(`${e.type}:${e.name}`)!)
+      const uniqueIds = [...new Set(entityIds)]
+
+      // --- Batch document-entity link insertion (was one SELECT + INSERT per entity) ---
+      const existingLinks = await db
+        .select({ entityId: documentEntities.entityId })
+        .from(documentEntities)
+        .where(eq(documentEntities.documentId, doc.id))
+
+      const linkedSet = new Set(existingLinks.map(l => l.entityId))
+
+      const linksToInsert = extracted
+        .map((e, i) => ({ e, id: entityIds[i] }))
+        .filter(({ id }) => !linkedSet.has(id))
+        .map(({ e, id }) => ({
+          documentId: doc.id,
+          entityId: id,
+          mentions: e.mentions,
+          context: e.contexts[0] || '',
+        }))
+
+      if (linksToInsert.length > 0) {
+        await db.insert(documentEntities).values(linksToInsert)
+      }
+
+      // --- Batch relationship upsert (was one SELECT per pair = O(n²) queries) ---
+      if (uniqueIds.length > 1) {
+        const existingRels = await db
+          .select()
+          .from(relationships)
+          .where(
+            and(
+              inArray(relationships.sourceId, uniqueIds),
+              inArray(relationships.targetId, uniqueIds)
+            )
+          )
+
+        const relMap = new Map<string, (typeof existingRels)[0]>()
+        for (const r of existingRels) {
+          relMap.set(`${r.sourceId}:${r.targetId}`, r)
+        }
+
+        const toInsertRels: {
+          sourceId: number; targetId: number
+          type: string; weight: number; documentId: number
+        }[] = []
+        const toUpdateRels: { id: number; weight: number }[] = []
+
+        for (let i = 0; i < uniqueIds.length; i++) {
+          for (let j = i + 1; j < uniqueIds.length; j++) {
+            const src = uniqueIds[i], tgt = uniqueIds[j]
+            const existing = relMap.get(`${src}:${tgt}`)
+            if (existing) {
+              toUpdateRels.push({ id: existing.id, weight: existing.weight + 0.5 })
+            } else {
+              toInsertRels.push({
+                sourceId: src, targetId: tgt,
+                type: 'CO_OCCURS', weight: 1, documentId: doc.id,
+              })
+            }
+          }
+        }
+
+        if (toInsertRels.length > 0) {
+          await db.insert(relationships).values(toInsertRels)
+        }
+        // Weight updates are only for pairs that already existed — typically few
+        for (const r of toUpdateRels) {
+          await db.update(relationships).set({ weight: r.weight }).where(eq(relationships.id, r.id))
+        }
+      }
+
+      return {
+        document: { id: doc.id, name: doc.name, type: doc.type },
+        entitiesExtracted: extracted.length,
+        relationships: (uniqueIds.length * (uniqueIds.length - 1)) / 2,
+      }
     })
+
+    return NextResponse.json(response)
   } catch (err) {
     console.error('Ingest error:', err)
     return NextResponse.json(

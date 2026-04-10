@@ -5,25 +5,52 @@ import { documents, entities, documentEntities, relationships } from './schema'
 
 const DB_PATH = path.join(process.cwd(), 'opengraph.db')
 
-let _db: ReturnType<typeof drizzle> | null = null
-let _sqlite: Database.Database | null = null
+// Use globalThis so the singleton survives Next.js Turbopack hot-module reloads
+// in development without creating multiple SQLite connections to the same file.
+const g = globalThis as typeof globalThis & {
+  __ogSqlite?: Database.Database
+  __ogDb?: ReturnType<typeof drizzle>
+}
 
-function getSqlite(): Database.Database {
-  if (!_sqlite) {
-    _sqlite = new Database(DB_PATH)
-    _sqlite.pragma('journal_mode = WAL')
-    _sqlite.pragma('foreign_keys = ON')
+export function getSqlite(): Database.Database {
+  if (!g.__ogSqlite) {
+    g.__ogSqlite = new Database(DB_PATH)
+    g.__ogSqlite.pragma('journal_mode = WAL')
+    g.__ogSqlite.pragma('foreign_keys = ON')
+    migrate(g.__ogSqlite)
   }
-  return _sqlite
+  return g.__ogSqlite
 }
 
 export function getDb() {
-  if (!_db) {
-    const sqlite = getSqlite()
-    _db = drizzle(sqlite, { schema: { documents, entities, documentEntities, relationships } })
-    migrate(sqlite)
+  if (!g.__ogDb) {
+    g.__ogDb = drizzle(getSqlite(), {
+      schema: { documents, entities, documentEntities, relationships },
+    })
   }
-  return _db
+  return g.__ogDb
+}
+
+/**
+ * Run `fn` inside a SQLite BEGIN/COMMIT/ROLLBACK block.
+ *
+ * better-sqlite3 is synchronous, so its `transaction()` helper cannot accept
+ * async callbacks. This wrapper issues the SQL statements manually; because
+ * Node.js is single-threaded and all better-sqlite3 calls complete in the
+ * same event-loop turn they are invoked in, concurrent ingest requests will
+ * naturally serialise at the BEGIN statement without nested-transaction errors.
+ */
+export async function withTransaction<T>(fn: () => Promise<T>): Promise<T> {
+  const sqlite = getSqlite()
+  sqlite.exec('BEGIN')
+  try {
+    const result = await fn()
+    sqlite.exec('COMMIT')
+    return result
+  } catch (err) {
+    try { sqlite.exec('ROLLBACK') } catch { /* ignore rollback errors */ }
+    throw err
+  }
 }
 
 function migrate(sqlite: Database.Database) {

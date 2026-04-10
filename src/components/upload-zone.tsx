@@ -15,12 +15,18 @@ interface UploadZoneProps {
   onSuccess?: (result: UploadResult) => void
 }
 
+interface QueueItem {
+  /** Unique per-upload id so two files with the same name don't collide. */
+  id: string
+  name: string
+}
+
 export function UploadZone({ onSuccess }: UploadZoneProps) {
   const inputRef = useRef<HTMLInputElement>(null)
   const [dragging, setDragging] = useState(false)
   const [uploading, setUploading] = useState(false)
   const [error, setError] = useState<string | null>(null)
-  const [queue, setQueue] = useState<string[]>([])
+  const [queue, setQueue] = useState<QueueItem[]>([])
 
   const processFile = useCallback(async (file: File) => {
     const ext = file.name.split('.').pop()?.toLowerCase()
@@ -29,7 +35,10 @@ export function UploadZone({ onSuccess }: UploadZoneProps) {
       return
     }
 
-    setQueue(q => [...q, file.name])
+    // Use a unique id per upload so identical filenames don't interfere
+    const uploadId = `${Date.now()}-${Math.random().toString(36).slice(2)}`
+    setQueue(q => [...q, { id: uploadId, name: file.name }])
+
     const form = new FormData()
     form.append('file', file)
 
@@ -42,7 +51,7 @@ export function UploadZone({ onSuccess }: UploadZoneProps) {
     } catch (e) {
       setError(e instanceof Error ? e.message : 'Upload failed')
     } finally {
-      setQueue(q => q.filter(n => n !== file.name))
+      setQueue(q => q.filter(item => item.id !== uploadId))
     }
   }, [onSuccess])
 
@@ -103,11 +112,11 @@ export function UploadZone({ onSuccess }: UploadZoneProps) {
 
       {queue.length > 0 && (
         <ul className="space-y-1.5" aria-label="Upload queue" aria-live="polite">
-          {queue.map((name) => (
-            <li key={name} className="flex items-center gap-2.5 px-3 py-2 rounded-lg bg-white/[0.04] text-xs text-white/60">
+          {queue.map((item) => (
+            <li key={item.id} className="flex items-center gap-2.5 px-3 py-2 rounded-lg bg-white/[0.04] text-xs text-white/60">
               <span className="size-3.5 rounded-full border-2 border-white/20 border-t-white animate-spin shrink-0" aria-hidden="true" />
               <File className="size-3.5 shrink-0 text-white/30" />
-              <span className="truncate">{name}</span>
+              <span className="truncate">{item.name}</span>
               <span className="ml-auto text-white/30">Processing&hellip;</span>
             </li>
           ))}

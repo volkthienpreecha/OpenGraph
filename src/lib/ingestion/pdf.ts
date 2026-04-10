@@ -1,12 +1,20 @@
-// pdf-parse uses dynamic require internally — works in Node.js server context
-// eslint-disable-next-line @typescript-eslint/no-require-imports
-const pdfParse = require('pdf-parse')
+import { PDFParse } from 'pdf-parse'
 
-export async function extractPdfText(buffer: Buffer): Promise<{ text: string; pages: number; info: Record<string, unknown> }> {
-  const data = await pdfParse(buffer)
+export async function extractPdfText(buffer: Buffer): Promise<{
+  text: string
+  pages: number
+  info: Record<string, unknown>
+}> {
+  const parser = new PDFParse({ data: buffer })
+  const [textResult, infoResult] = await Promise.all([
+    parser.getText(),
+    parser.getInfo().catch(() => null),
+  ])
+  await parser.destroy()
+
   return {
-    text: data.text as string,
-    pages: data.numpages as number,
-    info: (data.info ?? {}) as Record<string, unknown>,
+    text: textResult.text,
+    pages: textResult.total,
+    info: (infoResult?.info ?? {}) as Record<string, unknown>,
   }
 }

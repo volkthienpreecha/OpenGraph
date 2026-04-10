@@ -5,6 +5,13 @@ import { getFullGraph, findPaths } from '@/lib/graph/query'
 import { isNull, like, and, eq } from 'drizzle-orm'
 import type { EntityType } from '@/types'
 
+const MAX_QUERY_LEN = 200
+
+/** Escape SQLite LIKE wildcards so user input is treated as a literal string. */
+function escapeLike(s: string): string {
+  return s.replace(/%/g, '\\%').replace(/_/g, '\\_')
+}
+
 export async function POST(request: NextRequest) {
   try {
     const body = await request.json() as {
@@ -15,20 +22,29 @@ export async function POST(request: NextRequest) {
       hops?: number
     }
 
+    // Fix #8: validate input lengths to prevent catastrophic LIKE backtracking
+    if ((body.q?.length ?? 0) > MAX_QUERY_LEN ||
+        (body.from?.length ?? 0) > MAX_QUERY_LEN ||
+        (body.to?.length ?? 0) > MAX_QUERY_LEN) {
+      return NextResponse.json({ error: 'Query string too long (max 200 characters)' }, { status: 400 })
+    }
+
     const db = getDb()
 
     // Path query: from + to
     if (body.from && body.to) {
-      // Resolve entity names to IDs
+      const safeFrom = escapeLike(body.from)
+      const safeTo = escapeLike(body.to)
+
       const [fromEntity] = await db
         .select()
         .from(entities)
-        .where(and(like(entities.name, `%${body.from}%`), isNull(entities.mergedInto)))
+        .where(and(like(entities.name, `%${safeFrom}%`), isNull(entities.mergedInto)))
         .limit(1)
       const [toEntity] = await db
         .select()
         .from(entities)
-        .where(and(like(entities.name, `%${body.to}%`), isNull(entities.mergedInto)))
+        .where(and(like(entities.name, `%${safeTo}%`), isNull(entities.mergedInto)))
         .limit(1)
 
       if (!fromEntity || !toEntity) {
@@ -49,11 +65,12 @@ export async function POST(request: NextRequest) {
 
     // Text search: filter graph by name
     if (body.q) {
+      const safeQ = escapeLike(body.q)
       const matchingEntities = await db
         .select()
         .from(entities)
         .where(and(
-          like(entities.name, `%${body.q}%`),
+          like(entities.name, `%${safeQ}%`),
           isNull(entities.mergedInto),
           body.type ? eq(entities.type, body.type) : undefined
         ))
